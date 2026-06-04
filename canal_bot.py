@@ -616,7 +616,7 @@ async def postar_enquete():
             chat_id=CHANNEL_ID,
             question="🗳️ Qual mercado você quer na próxima múltipla?",
             options=MERCADOS_ENQUETE,
-            is_anonymous=False,
+            is_anonymous=True,
             allows_multiple_answers=False,
             open_period=3600  # 1h para votar
         )
@@ -814,11 +814,15 @@ async def monitorar_ao_vivo():
 # ── PROCESSAMENTO PRINCIPAL ────────────────────────────────────────────────────
 async def processar():
     global multipla_postada, dia_atual
-    logger.info("Verificando jogos...")
-
     tz    = pytz.timezone(TIMEZONE)
     agora = datetime.now(tz)
     hoje  = date.today().isoformat()
+
+    # Não verifica entre 2h e 8h — sem jogos nesse horário
+    if 2 <= agora.hour < 8:
+        return
+
+    logger.info("Verificando jogos...")
 
     if dia_atual != hoje:
         simples_postadas.clear()
