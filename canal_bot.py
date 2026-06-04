@@ -1,7 +1,8 @@
-import os, asyncio, httpx, pytz, logging, json
+import os, asyncio, httpx, pytz, logging, json, io
 from datetime import date, datetime
 from anthropic import Anthropic
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from PIL import Image, ImageDraw, ImageFont
 from telegram.ext import Application, PollAnswerHandler, ContextTypes
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -65,11 +66,11 @@ def tt(n): return TEAMS.get(n, n)
 def tl(n): return LEAGUES.get(n, n)
 
 def bet365_btn(home, away):
-    url = f"https://www.bet365.com/#/AC/B1/C1/D1002/E^{home.replace(' ','%20')}%20{away.replace(' ','%20')}/"
+    url = f"https://www.bet365.bet.br/#/AC/B1/C1/D1002/E^{home.replace(' ','%20')}%20{away.replace(' ','%20')}/"
     return InlineKeyboardMarkup([[InlineKeyboardButton("🎰 Criar aposta na Bet365", url=url)]])
 
 def bet365_btn_multipla():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🎰 Montar múltipla na Bet365", url="https://www.bet365.com/#/AC/B1/C1/D1002/")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎰 Montar múltipla na Bet365", url="https://www.bet365.bet.br/#/AC/B1/C1/D1002/")]])
 
 def parse_form(data, tid):
     res = []
@@ -214,6 +215,262 @@ Formato:
 ——————————————————
 ⏰ _Aposte AGORA — odds mudam a cada minuto!_
 ⚠️ _Aposte com responsabilidade._"""
+
+
+async def buscar_odds(fixture_id):
+    """Busca odds reais da Bet365 via API-Football"""
+    try:
+        data = await football_request("odds", {
+            "fixture": fixture_id,
+            "bookmaker": 8  # Bet365
+        })
+        response = data.get("response", [])
+        if not response:
+            return {}
+
+        odds_dict = {}
+        for item in response:
+            for bookmaker in item.get("bookmakers", []):
+                for bet in bookmaker.get("bets", []):
+                    bet_name = bet.get("name", "")
+                    values = {}
+                    for v in bet.get("values", []):
+                        values[v["value"]] = v["odd"]
+                    odds_dict[bet_name] = values
+
+        return odds_dict
+    except Exception as e:
+        logger.error("Erro buscar odds: " + str(e))
+        return {}
+
+def formatar_odds(odds_dict):
+    """Formata odds para contexto do Claude"""
+    if not odds_dict:
+        return "Odds não disponíveis — use estimativas baseadas nas estatísticas"
+
+    linhas = []
+    mercados_priority = [
+        "Match Winner", "Double Chance", "Both Teams Score",
+        "Goals Over/Under", "Asian Handicap", "Exact Score",
+        "First Half Winner", "Goals Over/Under First Half",
+        "Corner Over/Under", "Cards Over/Under",
+        "Result/Both Teams Score", "Draw No Bet"
+    ]
+
+    for mercado in mercados_priority:
+        if mercado in odds_dict:
+            vals = odds_dict[mercado]
+            linha = mercado + ": "
+            linha += " | ".join(k + "=" + str(v) for k, v in list(vals.items())[:4])
+            linhas.append(linha)
+
+    # Outros mercados
+    for mercado, vals in odds_dict.items():
+        if mercado not in mercados_priority:
+            linha = mercado + ": "
+            linha += " | ".join(k + "=" + str(v) for k, v in list(vals.items())[:3])
+            linhas.append(linha)
+
+    return "\n".join(linhas[:20])  # máx 20 mercados
+
+
+def criar_card_simples(info, palpites):
+    """Gera card visual do bilhete simples"""
+    W, H = 600, 60 + 70 + len(palpites) * 64 + 100
+    img  = Image.new("RGB", (W, H), "#0f0f0f")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+    except:
+        font_big = font_med = font_small = font_tiny = ImageFont.load_default()
+
+    GREEN  = "#39FF6B"
+    WHITE  = "#ffffff"
+    GRAY   = "#888888"
+    CARD   = "#1a1a1a"
+    BORDER = "#2a2a2a"
+
+    # Header
+    draw.rectangle([0, 0, W, 56], fill="#111111")
+    draw.text((20, 10), "🎫 BILHETE SIMPLES — SEU TIPSTER", font=font_med, fill=GREEN)
+    draw.text((20, 30), info["home"] + " x " + info["away"], font=font_big, fill=WHITE)
+    draw.text((20, 52), info["league"] + "  |  " + info["hora"], font=font_tiny, fill=GRAY)
+    draw.line([0, 70, W, 70], fill=BORDER, width=1)
+
+    y = 80
+    for p in palpites:
+        draw.rectangle([16, y, W-16, y+54], fill=CARD, outline=BORDER)
+        draw.text((28, y+8), p.get("mercado", ""), font=font_small, fill=GRAY)
+        draw.text((28, y+26), p.get("palpite", ""), font=font_med, fill=WHITE)
+        odd_str = "odd: " + str(p.get("odd", ""))
+        draw.text((W-90, y+26), odd_str, font=font_med, fill=GREEN)
+        y += 64
+
+    # Footer odd total
+    odd_total = 1.0
+    for p in palpites:
+        try: odd_total *= float(str(p.get("odd","1")).replace(",","."))
+        except: pass
+    odd_total = round(odd_total, 2)
+
+    draw.rectangle([0, H-80, W, H], fill="#111111")
+    draw.line([0, H-80, W, H-80], fill=BORDER, width=1)
+    draw.text((20, H-62), "Odd total estimada", font=font_small, fill=GRAY)
+    draw.text((20, H-40), str(odd_total), font=font_big, fill=GREEN)
+    r10 = round(10 * odd_total, 0)
+    r50 = round(50 * odd_total, 0)
+    draw.text((W-200, H-62), "R$10 → R$" + str(int(r10)), font=font_small, fill=GRAY)
+    draw.text((W-200, H-40), "R$50 → R$" + str(int(r50)), font=font_small, fill=GRAY)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def criar_card_multipla(jogos, odd_total):
+    """Gera card visual da múltipla"""
+    W, H = 600, 60 + 70 + len(jogos) * 72 + 100
+    img  = Image.new("RGB", (W, H), "#0f0f0f")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+    except:
+        font_big = font_med = font_small = font_tiny = ImageFont.load_default()
+
+    ORANGE = "#FFA500"
+    WHITE  = "#ffffff"
+    GRAY   = "#888888"
+    CARD   = "#1a1a1a"
+    BORDER = "#2a2a2a"
+
+    draw.rectangle([0, 0, W, 56], fill="#111111")
+    draw.text((20, 10), "🎰 MULTIPLA AGRESSIVA — SEU TIPSTER", font=font_med, fill=ORANGE)
+    draw.text((20, 30), str(len(jogos)) + " selecoes", font=font_big, fill=WHITE)
+    draw.line([0, 70, W, 70], fill=BORDER, width=1)
+
+    y = 80
+    for j in jogos:
+        draw.rectangle([16, y, W-16, y+62], fill=CARD, outline=BORDER)
+        draw.text((28, y+6), j.get("home","") + " x " + j.get("away","") + "  " + j.get("hora",""), font=font_small, fill=GRAY)
+        draw.text((28, y+24), j.get("mercado","") + ": " + j.get("palpite",""), font=font_med, fill=WHITE)
+        odd_str = "~" + str(j.get("odd",""))
+        draw.text((W-90, y+24), odd_str, font=font_med, fill=ORANGE)
+        y += 72
+
+    draw.rectangle([0, H-80, W, H], fill="#111111")
+    draw.line([0, H-80, W, H-80], fill=BORDER, width=1)
+    draw.text((20, H-62), "Odd total estimada", font=font_small, fill=GRAY)
+    draw.text((20, H-40), str(odd_total), font=font_big, fill=ORANGE)
+    r10 = round(10 * float(str(odd_total).replace(",",".")), 0)
+    r20 = round(20 * float(str(odd_total).replace(",",".")), 0)
+    draw.text((W-200, H-62), "R$10 -> R$" + str(int(r10)), font=font_small, fill=GRAY)
+    draw.text((W-200, H-40), "R$20 -> R$" + str(int(r20)), font=font_small, fill=GRAY)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def send_card_simples(texto, palpites_parsed, info, keyboard=None):
+    """Envia card visual + texto"""
+    try:
+        card_buf = criar_card_simples(info, palpites_parsed)
+        await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=card_buf,
+            caption=texto[:1024],
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error("Erro send card: " + str(e))
+        await send_msg(texto, keyboard=keyboard)
+
+
+async def send_card_multipla(texto, jogos_parsed, odd_total, keyboard=None):
+    """Envia card visual da múltipla + texto"""
+    try:
+        card_buf = criar_card_multipla(jogos_parsed, odd_total)
+        await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=card_buf,
+            caption=texto[:1024],
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error("Erro send card multipla: " + str(e))
+        await send_msg(texto, keyboard=keyboard)
+
+
+def parsear_palpites_simples(texto):
+    """Extrai palpites do texto gerado pelo Claude"""
+    palpites = []
+    linhas = texto.split("\n")
+    for i, linha in enumerate(linhas):
+        if "odd:" in linha.lower() and ("→" in linha or "->" in linha):
+            partes = linha.replace("✅","").replace("⚡","").replace("🔥","").strip()
+            mercado = ""
+            palpite = ""
+            odd = ""
+            if "→" in partes:
+                left, right = partes.split("→", 1)
+                mercado = left.replace("*","").strip()
+                if "odd:" in right.lower():
+                    palpite, odd_part = right.lower().split("odd:", 1)
+                    palpite = right.split("|")[0].strip() if "|" in right else palpite.strip()
+                    odd = odd_part.strip().split()[0].replace("*","")
+            if mercado:
+                palpites.append({"mercado": mercado[:30], "palpite": palpite[:30], "odd": odd})
+    return palpites[:6]
+
+
+def parsear_jogos_multipla(texto):
+    """Extrai jogos/seleções da múltipla"""
+    jogos = []
+    linhas = texto.split("\n")
+    jogo_atual = {}
+    for linha in linhas:
+        if "x" in linha and "|" in linha and ":" not in linha[:20]:
+            partes = linha.replace("✅","").strip()
+            if "x" in partes:
+                times = partes.split("|")[0].strip()
+                hora  = partes.split("|")[1].strip() if "|" in partes else ""
+                jogo_atual = {"home": times.split("x")[0].strip(),
+                              "away": times.split("x")[1].strip() if "x" in times else "",
+                              "hora": hora.replace("🕐","").strip()}
+        elif "📌" in linha and jogo_atual:
+            mercado_palpite = linha.replace("📌","").replace("*","").strip()
+            odd = ""
+            if "odd:" in mercado_palpite.lower():
+                parts = mercado_palpite.lower().split("odd:")
+                odd = parts[1].strip().split()[0].replace("~","") if len(parts) > 1 else ""
+                mercado_palpite = mercado_palpite.split("|")[0].strip()
+            if ":" in mercado_palpite:
+                m, p = mercado_palpite.split(":", 1)
+                jogo_atual["mercado"] = m.strip()[:25]
+                jogo_atual["palpite"] = p.strip()[:25]
+            jogo_atual["odd"] = odd
+            jogos.append(dict(jogo_atual))
+            jogo_atual = {}
+
+    # Odd total
+    odd_total = 1.0
+    for j in jogos:
+        try: odd_total *= float(str(j.get("odd","1")).replace(",","."))
+        except: pass
+
+    return jogos[:6], round(odd_total, 2)
 
 async def ia_simples(info):
     ctx = (f"Jogo: {info['home']} x {info['away']}\n"
