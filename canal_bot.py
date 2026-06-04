@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("CANAL_BOT_TOKEN", "")
+TELEGRAM_TOKEN   = os.environ.get("CANAL_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
 CHANNEL_ID       = os.environ.get("CHANNEL_ID", "@seutipster")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
