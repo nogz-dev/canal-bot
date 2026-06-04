@@ -586,7 +586,7 @@ async def processar():
             dt   = datetime.fromisoformat(f["fixture"]["date"]).astimezone(tz)
             mins = (dt - agora).total_seconds() / 60
 
-            if 110 <= mins <= 130 and fid not in simples_postadas:
+            if 60 <= mins <= 180 and fid not in simples_postadas:
                 info  = await coletar_info(f)
                 texto = await ia_simples(info)
                 if texto:
@@ -610,7 +610,7 @@ async def processar():
             proximo = datetime.fromisoformat(futuros[0]["fixture"]["date"]).astimezone(tz)
             mins_p  = (proximo - agora).total_seconds() / 60
 
-            if 100 <= mins_p <= 135:
+            if 60 <= mins_p <= 180:
                 logger.info(f"Gerando múltipla ({len(futuros)} jogos futuros)")
                 infos = await asyncio.gather(*[coletar_info(f) for f in futuros[:8]])
                 texto = await ia_multipla(list(infos))
@@ -633,7 +633,7 @@ async def processar():
             if len(novos) >= 2:
                 proximo_novo = datetime.fromisoformat(novos[0]["fixture"]["date"]).astimezone(tz)
                 mins_novo = (proximo_novo - agora).total_seconds() / 60
-                if 100 <= mins_novo <= 135:
+                if 60 <= mins_novo <= 180:
                     logger.info(f"Gerando múltipla extra ({len(novos)} novos jogos)")
                     infos = await asyncio.gather(*[coletar_info(f) for f in novos[:8]])
                     texto = await ia_multipla(list(infos))
