@@ -64,6 +64,9 @@ LEAGUES = {"International Friendlies":"Amistosos Internacionais",
 def tt(n): return TEAMS.get(n, n)
 def tl(n): return LEAGUES.get(n, n)
 
+def bet365_url(home, away):
+    return "https://www.bet365.bet.br/#/AC/B1/C1/D1002/E^" + home.replace(" ","%20") + "%20" + away.replace(" ","%20") + "/"
+
 def bet365_btn(home, away):
     url = f"https://www.bet365.bet.br/#/AC/B1/C1/D1002/E^{home.replace(' ','%20')}%20{away.replace(' ','%20')}/"
     return InlineKeyboardMarkup([[InlineKeyboardButton("🎰 Criar aposta na Bet365", url=url)]])
