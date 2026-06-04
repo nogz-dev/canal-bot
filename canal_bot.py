@@ -1,7 +1,8 @@
-import os, asyncio, httpx, pytz, logging
+import os, asyncio, httpx, pytz, logging, json
 from datetime import date, datetime
 from anthropic import Anthropic
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, PollAnswerHandler, ContextTypes
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -26,6 +27,8 @@ scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 # Estado
 simples_postadas = {}  # fid -> {msg_id, texto_original, fixture}
+enquetes_ativas  = {}  # poll_id -> {mercados, votos, msg_id}
+ultima_enquete   = None  # datetime da última enquete
 multiplas_dia    = []  # [{msg_id, texto_original, fixture_ids}]
 dia_atual        = None
 multipla_postada = False
@@ -184,6 +187,34 @@ Formato:
 ——————————————————
 ⚠️ _Aposte com responsabilidade._"""
 
+
+AO_VIVO_PROMPT = """Você é tipster especialista em apostas AO VIVO. Analise o estado atual do jogo e identifique oportunidades de alto valor.
+
+Foco: encontrar mercados onde as odds estão distorcidas pelo placar atual, minuto ou dinâmica do jogo.
+NUNCA escreva dado insuficiente. Seja direto e assertivo.
+
+Mercados ao vivo disponíveis (Bet365):
+Próximo Gol | Resultado Final | Ambos Marcam | Over/Under Gols restantes
+Escanteios restantes | Próximo Escanteio | Próximo Cartão
+Intervalo/Final | Gols no 2T | Empate Anula Aposta
+
+Formato:
+⚡⚡⚡ *APOSTA AO VIVO — SEU TIPSTER* ⚡⚡⚡
+🔴 *[Casa] [Placar] [Fora]* | [Minuto]
+🏆 [Liga]
+——————————————————
+🎯 *OPORTUNIDADE IDENTIFICADA*
+
+✅ *[Mercado]* → [Palpite] | odd: X.XX
+📌 [Justificativa baseada no estado atual do jogo]
+
+⚡ *[Mercado]* → [Palpite] | odd: X.XX
+📌 [Justificativa]
+
+——————————————————
+⏰ _Aposte AGORA — odds mudam a cada minuto!_
+⚠️ _Aposte com responsabilidade._"""
+
 async def ia_simples(info):
     ctx = (f"Jogo: {info['home']} x {info['away']}\n"
            f"Liga: {info['league']} | {info['data']} às {info['hora']}\n"
@@ -277,6 +308,253 @@ async def verificar_resultados():
         except Exception as e:
             logger.error(f"Erro verificar múltipla: {e}")
 
+
+# ── ENQUETES ──────────────────────────────────────────────────────────────────
+MERCADOS_ENQUETE = [
+    "⚽ Over/Under Gols",
+    "🎯 Ambas Marcam",
+    "🚩 Escanteios",
+    "🟨 Cartões",
+    "🕐 Gols 1º Tempo",
+    "🏅 Marcador",
+    "🔀 Handicap Asiático",
+    "💫 Chance Dupla",
+]
+
+MULTIPLA_MERCADO_PROMPT = """Tipster profissional. Crie uma MÚLTIPLA focada no mercado escolhido pelos membros.
+
+Mercado votado: {mercado}
+Regras: Só palpites desse mercado específico. Odds 1.50-2.50 por seleção. Odd total 5.00-15.00.
+3-5 jogos diferentes. NUNCA "dado insuficiente".
+
+Formato:
+🎰🎰🎰 *MÚLTIPLA ESPECIAL — {mercado}* 🎰🎰🎰
+_Gerada pela votação dos membros_ 🗳️
+📅 [data]
+——————————————————
+✅ *[Casa] x [Fora]* | 🕐 [Hora]
+📌 *{mercado}: [Palpite específico]* | odd: ~X.XX
+📊 [Justificativa 1 linha]
+
+——————————————————
+💰 *ODD TOTAL: ~X.XX*
+📈 R$10 → ~R$XX | R$20 → ~R$XXX
+⚡ *Stake: 1-2% da banca*
+——————————————————
+⚠️ _Aposte com responsabilidade._"""
+
+async def postar_enquete():
+    """Posta enquete de mercado no canal"""
+    global ultima_enquete
+    tz    = pytz.timezone(TIMEZONE)
+    agora = datetime.now(tz)
+
+    # Máx 2 enquetes por dia, intervalo de 4h
+    if ultima_enquete:
+        horas = (agora - ultima_enquete).total_seconds() / 3600
+        if horas < 4:
+            return
+
+    try:
+        poll = await bot.send_poll(
+            chat_id=CHANNEL_ID,
+            question="🗳️ Qual mercado você quer na próxima múltipla?",
+            options=MERCADOS_ENQUETE,
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            open_period=3600  # 1h para votar
+        )
+        enquetes_ativas[poll.poll.id] = {
+            "msg_id": poll.message_id,
+            "mercados": MERCADOS_ENQUETE,
+            "votos": {i: 0 for i in range(len(MERCADOS_ENQUETE))},
+            "respondida": False
+        }
+        ultima_enquete = agora
+        logger.info(f"✅ Enquete postada: {poll.poll.id}")
+    except Exception as e:
+        logger.error(f"Erro postar enquete: {e}")
+
+
+async def processar_resultado_enquete(poll_id: str):
+    """Gera múltipla baseada no mercado mais votado"""
+    if poll_id not in enquetes_ativas:
+        return
+    info = enquetes_ativas[poll_id]
+    if info["respondida"]:
+        return
+
+    votos = info["votos"]
+    if not votos or all(v == 0 for v in votos.values()):
+        return
+
+    # Mercado mais votado
+    idx_vencedor = max(votos, key=votos.get)
+    mercado = MERCADOS_ENQUETE[idx_vencedor]
+    total_votos = sum(votos.values())
+
+    logger.info(f"Gerando múltipla especial: {mercado} ({votos[idx_vencedor]}/{total_votos} votos)")
+
+    # Busca jogos do dia
+    hoje = date.today().isoformat()
+    tz   = pytz.timezone(TIMEZONE)
+    agora = datetime.now(tz)
+
+    try:
+        data     = await football_request("fixtures", {"date": hoje, "timezone": TIMEZONE})
+        fixtures = data.get("response", [])
+        futuros  = [f for f in fixtures
+                    if f["league"]["id"] in PRIORITY_LEAGUE_IDS
+                    and f["fixture"]["status"]["short"] == "NS"
+                    and (datetime.fromisoformat(f["fixture"]["date"]).astimezone(tz) - agora).total_seconds() / 60 > 40]
+
+        if len(futuros) < 2:
+            logger.info("Poucos jogos futuros para múltipla especial")
+            return
+
+        infos = await asyncio.gather(*[coletar_info(f) for f in futuros[:6]])
+        ctx = f"Mercado foco: {mercado}\n\nJogos:\n"
+        for j in infos:
+            ctx += f"{j['home']} x {j['away']} ({j['league']}) às {j['hora']}\nH2H: {j['h2h']}\n\n"
+
+        prompt = MULTIPLA_MERCADO_PROMPT.replace("{mercado}", mercado)
+        r = anthropic.messages.create(
+            model="claude-sonnet-4-5", max_tokens=1500,
+            system=prompt,
+            messages=[{"role":"user","content":ctx}]
+        )
+        texto = r.content[0].text
+
+        # Posta resultado da votacao + multipla
+        linha1 = "Resultado da Votacao: " + str(total_votos) + " votos"
+        linha2 = "Vencedor: " + mercado
+        intro = linha1 + "\n" + linha2 + "\n\n"
+        kb = bet365_btn_multipla()
+        msg_id = await send_msg(intro + texto, keyboard=kb)
+        multiplas_dia.append({
+            "msg_id": msg_id, "texto": texto,
+            "fixture_ids": [f["fixture"]["id"] for f in futuros[:6]],
+            "resultado": None
+        })
+        enquetes_ativas[poll_id]["respondida"] = True
+        logger.info(f"✅ Múltipla especial postada: {mercado}")
+
+    except Exception as e:
+        logger.error(f"Erro múltipla especial: {e}")
+
+
+async def verificar_enquetes_expiradas():
+    """Verifica enquetes com 1h+ e gera múltipla do vencedor"""
+    tz    = pytz.timezone(TIMEZONE)
+    agora = datetime.now(tz)
+
+    for poll_id, info in list(enquetes_ativas.items()):
+        if info["respondida"]:
+            continue
+        if not ultima_enquete:
+            continue
+        mins = (agora - ultima_enquete).total_seconds() / 60
+        if mins >= 60:  # 1h após a enquete
+            await processar_resultado_enquete(poll_id)
+
+
+async def ia_ao_vivo(fixture_ao_vivo):
+    """Gera palpite ao vivo baseado no estado atual do jogo"""
+    home  = fixture_ao_vivo["home"]
+    away  = fixture_ao_vivo["away"]
+    placar = fixture_ao_vivo["placar"]
+    minuto = fixture_ao_vivo["minuto"]
+    liga   = fixture_ao_vivo["league"]
+    stats  = fixture_ao_vivo.get("stats", "")
+
+    ctx = (
+        "Jogo ao vivo: " + home + " " + placar + " " + away +
+        " | Minuto: " + str(minuto) +
+        " | Liga: " + liga +
+        ("\nEstatísticas: " + stats if stats else "")
+    )
+    try:
+        r = anthropic.messages.create(
+            model="claude-sonnet-4-5", max_tokens=800,
+            system=AO_VIVO_PROMPT,
+            messages=[{"role":"user","content":ctx}])
+        return r.content[0].text
+    except Exception as e:
+        logger.error("Erro IA ao vivo: " + str(e))
+        return None
+
+# Controle ao vivo
+ao_vivo_postados = set()  # fixture_id + minuto
+
+async def monitorar_ao_vivo():
+    """Monitora jogos ao vivo e posta oportunidades"""
+    tz    = pytz.timezone(TIMEZONE)
+    agora = datetime.now(tz)
+    hoje  = date.today().isoformat()
+
+    try:
+        data     = await football_request("fixtures", {"date": hoje, "timezone": TIMEZONE})
+        fixtures = data.get("response", [])
+
+        ao_vivo = [f for f in fixtures
+                   if f["league"]["id"] in PRIORITY_LEAGUE_IDS
+                   and f["fixture"]["status"]["short"] in ["1H","2H","HT","ET","BT","LIVE"]]
+
+        for f in ao_vivo:
+            fid    = f["fixture"]["id"]
+            minuto = f["fixture"]["status"].get("elapsed") or 0
+            home   = tt(f["teams"]["home"]["name"])
+            away   = tt(f["teams"]["away"]["name"])
+            hg     = f["goals"]["home"] or 0
+            ag     = f["goals"]["away"] or 0
+            placar = str(hg) + "x" + str(ag)
+            status = f["fixture"]["status"]["short"]
+            liga   = tl(f["league"]["name"])
+
+            # Janelas estratégicas para postar ao vivo:
+            # - Aos 20-25 min (tendência do 1T estabelecida)
+            # - Aos 55-60 min (início do 2T)
+            # - Aos 70-75 min (pressão final)
+            janelas = [(20,25), (55,60), (70,75)]
+            chave = str(fid) + "_" + str(minuto // 5)  # agrupa por bloco de 5 min
+
+            em_janela = any(j[0] <= minuto <= j[1] for j in janelas)
+
+            if em_janela and chave not in ao_vivo_postados:
+                # Busca estatísticas do jogo
+                stats_str = ""
+                try:
+                    stats_data = await football_request("fixtures/statistics", {"fixture": fid})
+                    stats_list = stats_data.get("response", [])
+                    if stats_list:
+                        for team_stats in stats_list[:2]:
+                            t_name = tt(team_stats["team"]["name"])
+                            for s in team_stats.get("statistics", []):
+                                if s["type"] in ["Shots on Goal","Corner Kicks","Yellow Cards","Ball Possession"]:
+                                    val = s["value"] or 0
+                                    stats_str += t_name + " " + s["type"] + ": " + str(val) + " | "
+                except:
+                    pass
+
+                fixture_info = {
+                    "home": home, "away": away, "placar": placar,
+                    "minuto": minuto, "league": liga, "stats": stats_str
+                }
+
+                texto = await ia_ao_vivo(fixture_info)
+                if texto:
+                    link = bet365_url(home, away)
+                    kb   = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⚡ Apostar AO VIVO na Bet365", url=link)
+                    ]])
+                    await send_msg(texto, keyboard=kb)
+                    ao_vivo_postados.add(chave)
+                    logger.info("Ao vivo postado: " + home + " x " + away + " " + str(minuto) + "min")
+                    await asyncio.sleep(3)
+
+    except Exception as e:
+        logger.error("Erro monitorar ao vivo: " + str(e))
+
 # ── PROCESSAMENTO PRINCIPAL ────────────────────────────────────────────────────
 async def processar():
     global multipla_postada, dia_atual
@@ -322,28 +600,66 @@ async def processar():
                     logger.info(f"✅ Simples: {info['home']} x {info['away']}")
                     await asyncio.sleep(5)
 
-        # ── MÚLTIPLA DO DIA ──────────────────────────────────────────────────
-        if not multipla_postada and len(priority) >= 2:
-            primeiro = datetime.fromisoformat(priority[0]["fixture"]["date"]).astimezone(tz)
-            mins_p   = (primeiro - agora).total_seconds() / 60
+        # ── MÚLTIPLA ─────────────────────────────────────────────────────────
+        # Jogos com mais de 40 min de antecedência (ainda dá tempo de apostar)
+        futuros = [f for f in priority
+                   if (datetime.fromisoformat(f["fixture"]["date"]).astimezone(tz) - agora).total_seconds() / 60 > 40]
+
+        if not multipla_postada and len(futuros) >= 2:
+            # Posta múltipla 100-135 min antes do PRÓXIMO jogo que ainda vai acontecer
+            proximo = datetime.fromisoformat(futuros[0]["fixture"]["date"]).astimezone(tz)
+            mins_p  = (proximo - agora).total_seconds() / 60
 
             if 100 <= mins_p <= 135:
-                logger.info(f"Gerando múltipla ({len(priority)} jogos)")
-                infos = await asyncio.gather(*[coletar_info(f) for f in priority[:8]])
+                logger.info(f"Gerando múltipla ({len(futuros)} jogos futuros)")
+                infos = await asyncio.gather(*[coletar_info(f) for f in futuros[:8]])
                 texto = await ia_multipla(list(infos))
                 if texto:
                     kb     = bet365_btn_multipla()
                     msg_id = await send_msg(texto, keyboard=kb)
                     multiplas_dia.append({
                         "msg_id": msg_id, "texto": texto,
-                        "fixture_ids": [f["fixture"]["id"] for f in priority[:8]],
+                        "fixture_ids": [f["fixture"]["id"] for f in futuros[:8]],
                         "resultado": None
                     })
                     multipla_postada = True
-                    logger.info("✅ Múltipla do dia postada")
+                    logger.info("✅ Múltipla postada")
+
+        # Se a múltipla já foi postada mas ainda surgiu um novo bloco de jogos
+        # distantes mais de 3h do último grupo — posta uma segunda múltipla
+        elif multipla_postada and len(futuros) >= 2:
+            ultima_multipla_ids = set(multiplas_dia[-1]["fixture_ids"]) if multiplas_dia else set()
+            novos = [f for f in futuros if f["fixture"]["id"] not in ultima_multipla_ids]
+            if len(novos) >= 2:
+                proximo_novo = datetime.fromisoformat(novos[0]["fixture"]["date"]).astimezone(tz)
+                mins_novo = (proximo_novo - agora).total_seconds() / 60
+                if 100 <= mins_novo <= 135:
+                    logger.info(f"Gerando múltipla extra ({len(novos)} novos jogos)")
+                    infos = await asyncio.gather(*[coletar_info(f) for f in novos[:8]])
+                    texto = await ia_multipla(list(infos))
+                    if texto:
+                        kb     = bet365_btn_multipla()
+                        msg_id = await send_msg(texto, keyboard=kb)
+                        multiplas_dia.append({
+                            "msg_id": msg_id, "texto": texto,
+                            "fixture_ids": [f["fixture"]["id"] for f in novos[:8]],
+                            "resultado": None
+                        })
+                        logger.info("✅ Múltipla extra postada")
+
+        # ── AO VIVO ──────────────────────────────────────────────────────────
+        await monitorar_ao_vivo()
 
         # ── VERIFICA RESULTADOS ──────────────────────────────────────────────
         await verificar_resultados()
+
+        # ── ENQUETES ─────────────────────────────────────────────────────────
+        # Posta enquete entre 12h e 20h, se tiver jogos futuros
+        hora_atual = agora.hour
+        if 12 <= hora_atual <= 20 and len([f for f in priority if (datetime.fromisoformat(f["fixture"]["date"]).astimezone(tz) - agora).total_seconds()/60 > 60]) >= 2:
+            await postar_enquete()
+        # Verifica enquetes expiradas
+        await verificar_enquetes_expiradas()
 
     except Exception as e:
         logger.error(f"Erro processar: {e}")
@@ -366,6 +682,7 @@ async def resumo_final():
 async def limpar():
     global multipla_postada
     simples_postadas.clear(); multiplas_dia.clear()
+    ao_vivo_postados.clear()
     multipla_postada = False
 
 
@@ -376,6 +693,7 @@ async def main():
     logger.info(f"✅ Bot: @{me.username}")
     scheduler.add_job(processar,    "interval", minutes=5,   id="processar")
     scheduler.add_job(resumo_final, "cron", hour=23, minute=30, id="resumo")
+    scheduler.add_job(verificar_enquetes_expiradas, "interval", minutes=15, id="enquetes")
     scheduler.add_job(limpar,       "cron", hour=0,  minute=5,  id="limpar")
     scheduler.start()
     logger.info("✅ Rodando — simples + múltipla + resultados automáticos")
