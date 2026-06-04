@@ -1,8 +1,7 @@
-import os, asyncio, httpx, pytz, logging, json, io
+import os, asyncio, httpx, pytz, logging, json
 from datetime import date, datetime
 from anthropic import Anthropic
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from PIL import Image, ImageDraw, ImageFont
 from telegram.ext import Application, PollAnswerHandler, ContextTypes
 from telegram.constants import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -922,6 +921,19 @@ async def processar():
         logger.error(f"Erro processar: {e}")
 
 
+
+async def relatorio_semanal():
+    texto = gerar_relatorio("semana")
+    if texto:
+        await send_msg(texto)
+        logger.info("Relatório semanal postado")
+
+async def relatorio_mensal():
+    texto = gerar_relatorio("mes")
+    if texto:
+        await send_msg(texto)
+        logger.info("Relatório mensal postado")
+
 async def resumo_final():
     tz   = pytz.timezone(TIMEZONE)
     hoje = datetime.now(tz).strftime("%d/%m/%Y")
@@ -943,6 +955,113 @@ async def limpar():
     multipla_postada = False
 
 
+
+async def cmd_link(update, context):
+    """
+    Comando para atualizar o link do botão da última mensagem postada.
+    Uso: /link https://www.bet365.bet.br/...
+    Só funciona para o admin (CHAT_ID)
+    """
+    admin_id = int(os.environ.get("ADMIN_ID", "0"))
+    user_id  = update.effective_user.id
+
+    if admin_id and user_id != admin_id:
+        await update.message.reply_text("Sem permissao.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /link [simples|multipla] https://link-da-bet365\n\n"
+            "Exemplo:\n/link simples https://www.bet365.bet.br/..."
+        )
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("Informe o tipo e o link. Ex: /link simples https://...")
+        return
+
+    tipo = args[0].lower()
+    novo_link = args[1]
+
+    # Pega a última mensagem do tipo correto
+    msg_id = None
+    texto_original = None
+
+    if tipo == "simples" and simples_postadas:
+        ultimo = list(simples_postadas.values())[-1]
+        msg_id = ultimo.get("msg_id")
+        texto_original = ultimo.get("texto", "")
+    elif tipo == "multipla" and multiplas_dia:
+        ultimo = multiplas_dia[-1]
+        msg_id = ultimo.get("msg_id")
+        texto_original = ultimo.get("texto", "")
+
+    if not msg_id:
+        await update.message.reply_text("Nenhuma mensagem " + tipo + " encontrada para atualizar.")
+        return
+
+    # Novo botão com link personalizado
+    novo_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎰 Apostar na Bet365", url=novo_link)
+    ]])
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=CHANNEL_ID,
+            message_id=msg_id,
+            reply_markup=novo_kb
+        )
+        await update.message.reply_text("Botao atualizado com sucesso!")
+        logger.info("Link atualizado: " + tipo + " -> " + novo_link)
+    except Exception as e:
+        await update.message.reply_text("Erro ao atualizar: " + str(e))
+
+
+async def cmd_link_all(update, context):
+    """
+    /linkall https://... — atualiza TODOS os botoes do dia com o mesmo link
+    """
+    admin_id = int(os.environ.get("ADMIN_ID", "0"))
+    if admin_id and update.effective_user.id != admin_id:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /linkall https://link-da-bet365")
+        return
+
+    novo_link = args[0]
+    novo_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎰 Apostar na Bet365", url=novo_link)
+    ]])
+
+    atualizados = 0
+
+    # Atualiza simples
+    for fid, info in simples_postadas.items():
+        mid = info.get("msg_id")
+        if mid:
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=CHANNEL_ID, message_id=mid, reply_markup=novo_kb)
+                atualizados += 1
+                await asyncio.sleep(0.3)
+            except: pass
+
+    # Atualiza múltiplas
+    for m in multiplas_dia:
+        mid = m.get("msg_id")
+        if mid:
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=CHANNEL_ID, message_id=mid, reply_markup=novo_kb)
+                atualizados += 1
+                await asyncio.sleep(0.3)
+            except: pass
+
+    await update.message.reply_text(str(atualizados) + " botoes atualizados!")
+
 async def main():
     global dia_atual
     dia_atual = date.today().isoformat()
@@ -950,6 +1069,8 @@ async def main():
     logger.info(f"✅ Bot: @{me.username}")
     scheduler.add_job(processar,    "interval", minutes=5,   id="processar")
     scheduler.add_job(resumo_final, "cron", hour=23, minute=30, id="resumo")
+    scheduler.add_job(relatorio_semanal, "cron", day_of_week="sun", hour=20, minute=0, id="relatorio_semanal")
+    scheduler.add_job(relatorio_mensal,  "cron", day=1, hour=10, minute=0, id="relatorio_mensal")
     scheduler.add_job(verificar_enquetes_expiradas, "interval", minutes=15, id="enquetes")
     scheduler.add_job(limpar,       "cron", hour=0,  minute=5,  id="limpar")
     scheduler.start()
