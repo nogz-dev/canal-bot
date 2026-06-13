@@ -910,9 +910,6 @@ async def processar():
                         })
                         logger.info("✅ Múltipla extra postada")
 
-        # ── AO VIVO ──────────────────────────────────────────────────────────
-        await monitorar_ao_vivo()
-
         # ── VERIFICA RESULTADOS ──────────────────────────────────────────────
         await verificar_resultados()
 
