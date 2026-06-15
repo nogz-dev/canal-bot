@@ -16,10 +16,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TIMEZONE          = "America/Sao_Paulo"
 FOOTBALL_API_URL  = "https://v3.football.api-sports.io"
 
-PRIORITY_LEAGUE_IDS = {
-    1,2,3,9,10,11,13,29,39,61,71,72,75,76,
-    78,94,128,135,140,203,262,307,612,667,848,914
-}
+# Foco na Copa do Mundo — ID 1
+PRIORITY_LEAGUE_IDS = {1}
 
 bot       = Bot(token=TELEGRAM_TOKEN)
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
